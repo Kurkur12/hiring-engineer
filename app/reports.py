@@ -1,37 +1,117 @@
-"""Your work goes here: the weekly report and its cache.
+"""Aggregate-only weekly cache and precise delta updates."""
 
-Rules (see the README):
-- Read raw rows only through `scan_raw()`.
-- Keep your cache in DuckDB tables on `db`, holding aggregated results.
-- You decide what to cache, when to fill it, and how to refresh it.
+from datetime import date, timedelta
 
-`app/main.py` calls these three functions. Add any helpers you need.
-"""
+from app.raw import db, scan_raw
 
-from datetime import date
-
-from app.raw import db, scan_raw  # noqa: F401
+_delta_loaded = False
 
 
 def startup() -> None:
-    """Called once when the service starts, before it accepts requests.
+    """Create cache tables without scanning the expensive source."""
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS weekly_totals (
+            shop_id VARCHAR NOT NULL,
+            week_start DATE NOT NULL,
+            revenue BIGINT NOT NULL,
+            units BIGINT NOT NULL,
+            PRIMARY KEY (shop_id, week_start)
+        )
+    """)
+    db.execute("CREATE TABLE IF NOT EXISTS cached_weeks (week_start DATE PRIMARY KEY)")
 
-    Precompute here if your design needs it. Leaving it empty is fine.
-    """
+
+def _ensure_week(week_start: date) -> None:
+    if db.execute("SELECT 1 FROM cached_weeks WHERE week_start = ?", [week_start]).fetchone():
+        return
+    dates = [week_start + timedelta(days=i) for i in range(7)]
+    with scan_raw("base", dates) as base:
+        if _delta_loaded:
+            with scan_raw("delta", dates) as delta:
+                rows = f"""
+                    SELECT DISTINCT b.* FROM {base} b
+                    ANTI JOIN {delta} d USING (shop_id, product_id, date)
+                    UNION
+                    SELECT DISTINCT * FROM {delta}
+                """
+                _fill_week(week_start, rows)
+        else:
+            _fill_week(week_start, f"SELECT DISTINCT * FROM {base}")
+
+
+def _fill_week(week_start: date, rows: str) -> None:
+    db.execute(f"""
+        INSERT INTO weekly_totals
+        SELECT shop_id, ?::DATE, sum(revenue)::BIGINT, sum(units_sold)::BIGINT
+        FROM ({rows}) GROUP BY shop_id
+    """, [week_start])
+    # A week with no source rows still needs a cache marker.
+    db.execute("INSERT INTO cached_weeks VALUES (?)", [week_start])
 
 
 def weekly_report(shop_id: str, week_start: date) -> dict:
-    """Return the report for one shop and one ISO week.
-
-    `week_start` is the Monday of the requested week. The result must include
-    `revenue` and `units` (integers) and `revenue_wow_pct` (a number or None).
-    """
-    raise NotImplementedError("weekly_report is not implemented yet")
+    """Read this week and its predecessor from the aggregate cache."""
+    _ensure_week(week_start)
+    _ensure_week(week_start - timedelta(days=7))
+    rows = db.execute("""
+        SELECT week_start, revenue, units FROM weekly_totals
+        WHERE shop_id = ? AND week_start IN (?, ?)
+    """, [shop_id, week_start, week_start - timedelta(days=7)]).fetchall()
+    by_week = {week: (revenue, units) for week, revenue, units in rows}
+    revenue, units = by_week.get(week_start, (0, 0))
+    previous = by_week.get(week_start - timedelta(days=7))
+    previous_revenue = previous[0] if previous else 0
+    wow = 100.0 * (revenue - previous_revenue) / previous_revenue if previous_revenue else None
+    return {"revenue": int(revenue), "units": int(units), "revenue_wow_pct": wow}
 
 
 def on_delta_loaded() -> None:
-    """Called by POST /load-delta, after the delta is available as source "delta".
+    """Replace affected product-days and apply their net weekly changes."""
+    global _delta_loaded
+    with scan_raw("delta") as delta:
+        dates = [row[0] for row in db.execute(f"""
+            SELECT DISTINCT d.date FROM {delta} d
+            JOIN cached_weeks w ON date_trunc('week', d.date)::DATE = w.week_start
+        """).fetchall()]
+        if dates:
+            with scan_raw("base", dates) as base:
+                db.execute(f"""
+                    CREATE TEMP TABLE weekly_changes AS
+                    WITH old_rows AS (
+                        SELECT DISTINCT b.* FROM {base} b
+                        SEMI JOIN {delta} d
+                        ON b.shop_id = d.shop_id
+                        AND b.product_id = d.product_id
+                        AND b.date = d.date
+                    ), changes AS (
+                        SELECT d.shop_id, d.date, d.revenue, d.units_sold
+                        FROM (SELECT DISTINCT * FROM {delta}) d
+                        JOIN cached_weeks w
+                        ON date_trunc('week', d.date)::DATE = w.week_start
+                        UNION ALL
+                        SELECT shop_id, date, -revenue, -units_sold FROM old_rows
+                    )
+                    SELECT shop_id, date_trunc('week', date)::DATE AS week_start,
+                           sum(revenue)::BIGINT AS revenue,
+                           sum(units_sold)::BIGINT AS units
+                    FROM changes
+                    GROUP BY shop_id, date_trunc('week', date)::DATE
+                """)
 
-    Return only when every report is up to date.
-    """
-    raise NotImplementedError("on_delta_loaded is not implemented yet")
+            try:
+                db.execute("BEGIN TRANSACTION")
+                try:
+                    db.execute("""
+                        INSERT INTO weekly_totals
+                        SELECT shop_id, week_start, revenue, units FROM weekly_changes
+                        ON CONFLICT (shop_id, week_start) DO UPDATE SET
+                            revenue = weekly_totals.revenue + excluded.revenue,
+                            units = weekly_totals.units + excluded.units
+                    """)
+                    db.execute("COMMIT")
+                except Exception:
+                    db.execute("ROLLBACK")
+                    raise
+            finally:
+                db.execute("DROP TABLE weekly_changes")
+    _delta_loaded = True
